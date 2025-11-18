@@ -1,0 +1,14 @@
+{
+  "catchment": "Area06",
+  "hy_xxxx": "hy2223",
+  "emisphere": "South",
+  "dirname": "/mnt/CEPH_PROJECTS/SNOWCOP/Paloma/Area06/sca_harm",
+  "meteodir": "/mnt/CEPH_PROJECTS/SNOWCOP/Paloma/Area06/Micromet",
+  "outdir": "/mnt/CEPH_PROJECTS/SNOWCOP/Paloma/Area06/SWE",
+  "DEM_path": "/mnt/CEPH_PROJECTS/SNOWCOP/Paloma/Area06/Landsat/LC08/01_TEST_auxiliary_folder/LC08_DEM.tif",
+  "pixel_ratio": 10,
+  "outformat": "nc",
+  "exclude_LR": false,
+  "gapfilling_flag": true,
+  "downscaling_flag": true
+}
