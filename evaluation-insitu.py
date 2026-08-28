@@ -8,6 +8,33 @@ Created on Fri Nov  7 17:46:51 2025
 
 import pandas as pd
 import geopandas as gpd
+import xarray as xr
+import numpy as np
+import matplotlib.pyplot as plt
+import os
+import rasterio
+import glob
+
+from loading import load_micromet, load_era5land
+from utils import load_config, upload_sca
+from melting import get_status_and_delta, get_melt_pomeroy
+
+config_path = r'/home/vpremier/Documents/git/SNOWCOP/SWE_reconstruction/config.json'
+
+config = load_config(config_path)
+
+hy_xxxx = 'hy2021'
+
+
+meteodir = config['meteodir']
+
+dirname = config['dirname']
+
+
+# catchment name
+catchment = config['catchment']
+
+temp_dir = os.path.join(meteodir, 'outputs', 'Temperature_biascorr')
 
 
 ta_shp = r'/mnt/CEPH_PROJECTS/SNOWCOP/Dati/data-merged/air_temperature.shp'
@@ -19,7 +46,7 @@ swe_csv = r'/mnt/CEPH_PROJECTS/SNOWCOP/Dati/data-merged/SWE.csv'
 SW_shp = r'/mnt/CEPH_PROJECTS/SNOWCOP/Dati/data-merged/SW_radiation.shp'
 SW_csv = r'/mnt/CEPH_PROJECTS/SNOWCOP/Dati/data-merged/SW_radiation.csv'
 
-outdir = r'/mnt/CEPH_PROJECTS/SNOWCOP/Vale/albedo_pomeroy'
+outdir = r'/mnt/CEPH_PROJECTS/SNOWCOP/Vale/swe_bias_corr'
 
 ta_df = pd.read_csv(ta_csv)
 ta_stas = gpd.read_file(ta_shp)
@@ -31,13 +58,21 @@ sw_df = pd.read_csv(SW_csv)
 sw_stas = gpd.read_file(SW_shp)
 
 
+ta = load_micromet(temp_dir, hy_xxxx) - 273.15
+
+
+SW_dir = os.path.join(meteodir, 'outputs', 'SW')
+
+era5_dir = os.path.join(meteodir, 'inputs', 'climate')
+
+
 # Get spatial bounds of the dataset (assuming `ta` is another GeoDataFrame)
 x_min, x_max = float(ta.x.min()), float(ta.x.max())
 y_min, y_max = float(ta.y.min()), float(ta.y.max())
 
 start, end = ta.time.min().values, ta.time.max().values
 
-
+dem_path = config['DEM_path']
 dem = rasterio.open(dem_path)
 
 # Option 1 — manual bounding box filter
@@ -55,9 +90,44 @@ selected_stations = gpd.GeoDataFrame(selected, crs=swe_stas.crs)
 print(f"✅ Selected {len(selected_stations)} stations within dataset bounds")
     
 
+sca_path = glob.glob(dirname + os.sep + catchment + '*' + hy_xxxx + '*.nc')[0]
+
+
+
+SCA, epsg_code = upload_sca(sca_path, dem_path, None)
+SCA = SCA.rio.write_crs(epsg_code['projection'], inplace=True)  
+SCA = SCA.load()
+        
+# --- meteorological data ---
+ta = load_micromet(temp_dir, hy_xxxx) - 273.15
+# ta = ta.chunk({'time':1, 'x':512, 'y':512})
+# ta = ta.load()
+SW = load_micromet(SW_dir, hy_xxxx)
+# SW = SW.load()
+# SW = SW.chunk({'time':1, 'x':512, 'y':512})
+
+era5 = load_era5land(era5_dir, hy_xxxx)
+        
+temp_thres = 0 
+prec_thres = 10      
+status, delta, pr_reprojected = get_status_and_delta(SCA, ta, era5, temp_thres=temp_thres, prec_thres=prec_thres)
+
+# with albedo varying with a prognostic function
+TF = 0.24 # melt factor mm / (°C day)
+SRF = 0.15 # melt factor mm / (°C day)
+# melt = get_melt(SCA, ta, pr_reprojected, SW, status, TF = TF, SRF = SRF)
+melt = get_melt_pomeroy(SCA, ta, pr_reprojected, SW, status, TF = TF, SRF = SRF, T_thresh=temp_thres)
+
+
+swe_path = f'/mnt/CEPH_PROJECTS/SNOWCOP/Paloma/Area06/SWE_soglia/Area06_{hy_xxxx}_harm.nc'
+swe = xr.open_dataset(swe_path).SWE.values
+           
 # --- Loop over selected stations ---
 for _, s in selected_stations.iterrows():
     sta_name = s.get("sta_name", "unknown")
+    
+    # if sta_name == 'Laguna Negra':
+    #     break
     source_file = s.get("source_fil", None)
     x_sta, y_sta = s.geometry.x, s.geometry.y
     
@@ -79,7 +149,10 @@ for _, s in selected_stations.iterrows():
         if obs_series.isna().all():
             print(f"⚠️ No overlapping data for {sta_name} — column: {col}")
             continue
-    
+        
+        
+        obs_series['2020-11-01':] = 0
+        obs_series[obs_series<0] = 0
     
         sca_ts = SCA.SCA[:, iy, ix].values
         pr_ts  = pr_reprojected[:, iy, ix].values
@@ -89,7 +162,8 @@ for _, s in selected_stations.iterrows():
         sw_ts = SW.SW[:, iy, ix]  # new melt array
         temp_ts = ta.t2m[:, iy, ix]  # new melt array
 
-
+        plt.plot(melt_ts)
+        plt.plot(temp_ts)
      
         time_vals = SCA.time.values
      
@@ -98,6 +172,9 @@ for _, s in selected_stations.iterrows():
             3, 1, figsize=(10, 10), sharex=True,
             gridspec_kw={'hspace': 0.3}
         )
+        
+     
+
         
         # =========================
         # Subplot 1: Albedo, SCA, Precipitation, Status
@@ -164,6 +241,7 @@ for _, s in selected_stations.iterrows():
         
         ax4.set_ylabel('Temperature (°C)', color=color_temp)
         ax4.plot(time_vals, temp_ts, color=color_temp, label='Temperature')
+        ax4.axhline(0, color='black', lw=1, ls='--')
         ax4.tick_params(axis='y', labelcolor=color_temp)
         
         # --- Twin axis for shortwave radiation ---
@@ -177,6 +255,32 @@ for _, s in selected_stations.iterrows():
         ax5.legend(loc='upper right')
         ax4.set_xlabel('Time')
         ax4.set_title('Temperature and Shortwave Radiation')
+        
+        # # ----------------------
+        # # Subplot 4: Backscatter
+        # # ----------------------
+        # # Extract hours from datetime index
+        # hours = backscatter.time.dt.hour
+        
+        # Boolean masks
+        # mask_9 = hours == 9
+        # mask_23 = hours == 23
+        
+        # Create subplot
+        # ax6.plot(backscatter.time[mask_9], backscatter[mask_9],
+        #          'o-', color='tab:blue', label='09:56 UTC pass')
+        
+        # ax6.plot(backscatter.time[mask_23], backscatter[mask_23],
+        #          'o-', color='tab:red', label='23:27 UTC pass')
+        
+        # ax6.set_ylabel('Backscatter')
+        # ax6.set_xlabel('Time')
+        # ax6.set_title('Backscatter over time')
+        # ax6.legend(loc='upper right')
+
+        # ax5.plot(time_vals, melt_ts, linestyle='-', alpha=0.7, label='Melt')
+
+
         
         # =========================
         # Final formatting

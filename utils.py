@@ -21,7 +21,7 @@ import rasterio.features
 import json
 
 from tqdm import tqdm  # Progress bar (optional)
-from kriging import get_kriging
+#from kriging import get_kriging
 
 
 def load_config(config_path):
@@ -668,13 +668,16 @@ def get_LR_mask(mask, pixel_ratio=20, nv_thres=40):
 
 
 
+
 def save_nc(outname, array, info, df, varname, unit, scale=1, dtype = 'int32',
             complevel = 9):
    
 
     time = df.index
     reference_time = df.index[0]
-
+    
+        
+ 
     if type(array) is xr.core.dataset.Dataset:
         da = array
        
@@ -688,10 +691,11 @@ def save_nc(outname, array, info, df, varname, unit, scale=1, dtype = 'int32',
             info['geotransform'][5]*np.arange(ny)
         
  
+    
         da = xr.DataArray(
             name = varname,
             data=array,
-            dims=["time","y","x"],
+            dims=["time", "y","x"],
             coords=dict(
                 x=(["x"], x),
                 y=(["y"], y),
@@ -704,16 +708,40 @@ def save_nc(outname, array, info, df, varname, unit, scale=1, dtype = 'int32',
         )
     
         da = da.transpose("time", "y", "x")
+
+    if os.path.exists(outname):
+        print("The output netcdf already exists")
+        da_0 = load_ts(outname)
+        da = xr.combine_by_coords([da_0, da])
+        os.remove(outname)
         
     #get EPSG
     srs = osr.SpatialReference()
     srs.ImportFromWkt(info['projection'])
     
-    da.rio.write_crs("epsg:" + srs.GetAttrValue('AUTHORITY',1), inplace=True)
+    # da = da.assign_coords({"crs": info['projection']})
+
+
+
+    da.rio.write_crs("epsg:" + srs.GetAttrValue('AUTHORITY',1), 
+                     inplace=True).rio.set_spatial_dims(
+                         x_dim="x",
+                         y_dim="y",inplace=True).rio.write_coordinate_system(inplace=True)
+                         
+    da.rio.write_coordinate_system("epsg:" + srs.GetAttrValue('AUTHORITY',1))
     
-    encode = {varname: {'zlib': True, 'complevel':complevel, 
-                        'scale_factor': scale,
-                        'dtype': dtype}} 
+    encode = {
+        varname: {
+            'zlib': True,
+            'complevel': complevel,
+            'dtype': dtype
+        }
+    }
+    
+    # Only add scale_factor if different from 1
+    if scale != 1:
+        encode[varname]['scale_factor'] = scale
+    
     da.to_netcdf(outname, encoding=encode)
 
 

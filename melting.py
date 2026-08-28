@@ -50,14 +50,24 @@ def get_status_and_delta(SCA, ta, era5, temp_thres=1.0, prec_thres=1.0):
 
     # Boolean accumulation mask
     status = xr.where(
-                    (ta['t2m'] < temp_thres) & (pr_reprojected > prec_thres),
+                    (ta['t2m'] < 2) & (pr_reprojected > prec_thres),
                     1,
                     -1
                 ).astype('int8')
     
+    # status = xr.where(
+    #         (ta['t2m'] < 2) & (pr_reprojected > prec_thres),
+    #         1,
+    #         xr.where(
+    #             ta['t2m'] > temp_thres,
+    #             -1,
+    #             0
+    #         )
+    #     ).astype('int8')
     
+
     # Masked precipitation
-    masked_pr = pr_reprojected.where(status)
+    masked_pr = pr_reprojected.where(status==1)
     
     # Total accumulation per pixel (lazy reduction)
     sum_pr = masked_pr.sum(dim='time')
@@ -144,6 +154,7 @@ def compute_state_and_accumulation(SCA, melt, status, delta):
     for i in range(len(time) - 1):
         date = pd.Timestamp(time[i + 1].values).strftime("%Y-%m-%d")
         print(f"Processing {i}: {date}")
+        
     
         # Snow cover for previous and current day
         snow_prev = SCA[dict(time=i)]['SCA'].values
@@ -378,7 +389,7 @@ def get_melt_prognostic(SCA, ta, pr_reprojected, SW, status, TF=1.2, SRF=0.2256)
 
 
 
-def get_melt_pomeroy(SCA, ta, pr_reprojected, SW, status, TF=1.2, SRF=0.2256):
+def get_melt_pomeroy(SCA, ta, pr_reprojected, SW, status, TF=1.2, SRF=0.2256, T_thresh=2):
 
     # --- Parameters ---
     d_wet = 0.005*24 
@@ -394,11 +405,16 @@ def get_melt_pomeroy(SCA, ta, pr_reprojected, SW, status, TF=1.2, SRF=0.2256):
     melt = np.zeros(dim, dtype=np.float32)
 
     time = SCA.time
+    
+    dim_yx = (SCA.sizes["y"], SCA.sizes["x"])
+    STS_prev = np.zeros(dim_yx, dtype=np.float32)
+
 
     # --- Time loop ---
     for i in range(len(time) - 1):
         date = pd.Timestamp(time[i + 1].values).strftime("%Y-%m-%d")
         print(f"Processing {i}: {date}")
+        
 
         # Previous albedo
         alb_prev = albs[i, :, :].copy()
@@ -406,9 +422,7 @@ def get_melt_pomeroy(SCA, ta, pr_reprojected, SW, status, TF=1.2, SRF=0.2256):
         # Current timestep variables
         sca_curr = SCA.SCA[i + 1, :, :]
         status_curr = status[i + 1, :, :]
-        ta_prev = ta.t2m[i, :, :]
         ta_curr = ta.t2m[i + 1, :, :]
-        SW_prev = SW.SW[i, :, :]
         SW_curr = SW.SW[i + 1, :, :]
 
         # Precipitation
@@ -421,7 +435,7 @@ def get_melt_pomeroy(SCA, ta, pr_reprojected, SW, status, TF=1.2, SRF=0.2256):
         alb_wet = ((alb_prev - asmn) * np.exp(-d_wet)) + asmn
         
         alb_t = alb_dry.copy()
-        alb_t = np.where(ta_curr < 0, alb_dry, alb_wet)
+        alb_t = np.where(ta_curr < T_thresh, alb_dry, alb_wet)
         
         alb_curr = alb_prev.copy()
         alb_curr[mask] = alb_t[mask] + (asmx - alb_t[mask]) * (pr_curr[mask] / Salb)
@@ -430,11 +444,28 @@ def get_melt_pomeroy(SCA, ta, pr_reprojected, SW, status, TF=1.2, SRF=0.2256):
         alb_curr = np.clip(alb_curr, asmn, asmx)
         albs[i + 1, :, :] = alb_curr
         
-
+        
+        theta = 0.5
+        #STS = np.minimum(theta * STS_prev + (1 - theta) * ta_curr, 0)
+        # Thermal inertia
         # --- Step 6: Compute current melt with updated albedo ---
-        melt[i + 1, :, :] = (
-            TF * ta_curr.where(ta_curr > 0, 0) + SRF * SW_curr * (1 - alb_curr)
+        # melt[i + 1, :, :] = (
+        #     TF * ta_curr.where((ta_curr > T_thresh) & (STS == 0), 0) + \
+        #     SRF * SW_curr.where((ta_curr > T_thresh) & (STS == 0), 0) * (1 - alb_curr)
+        # )
+        
+            
+        melt[i + 1, :, :] = np.minimum(
+            TF * ta_curr.where(ta_curr > T_thresh, 0) +
+            SRF * SW_curr.where(ta_curr > T_thresh, 0) * (1 - alb_curr),
+            60
         )
+        if i < 122:
+            melt[i + 1, :, :]= 0
+        
+        
+        
+        #STS_prev = STS
 
     # --- Convert melt array to xarray.DataArray ---
     melt_da = xr.DataArray(
@@ -457,10 +488,10 @@ def get_melt_pomeroy(SCA, ta, pr_reprojected, SW, status, TF=1.2, SRF=0.2256):
     
 
 
-# Choose pixel
-# iy, ix = 1805, 325
+# # Choose pixel
+# iy, ix = 1363, 625
 
-# # Extract time series
+# # # Extract time series
 # time_vals = SCA.time.values
 # alb_ts   = albs[:, iy, ix]
 # temp_ts  = ta.t2m[:, iy, ix]
@@ -497,13 +528,15 @@ def get_melt_pomeroy(SCA, ta, pr_reprojected, SW, status, TF=1.2, SRF=0.2256):
 
 # # Temperature line
 # ax1.plot(time_vals, temp_ts, color='tab:red', lw=2, label='Temperature')
-# ax1.axhline(0, color='black', lw=1, ls='--')
+# ax1.axhline(-1, color='black', lw=1, ls='--')
 # ax1.set_ylabel("Temperature [°C]")
 # ax1.grid(alpha=0.3)
 
 # # Twin axis for precipitation
 # ax2 = ax1.twinx()
-# ax2.plot(time_vals, pr_ts, color='tab:cyan', alpha=0.35, label='Precipitation', lw=2)
+# pr_ts_plot = pr_ts.copy()
+# pr_ts_plot[pr_ts<5] = 0
+# ax2.plot(time_vals, pr_ts_plot, color='tab:cyan', alpha=0.35, label='Precipitation', lw=2)
 # ax2.set_ylabel("Precipitation [mm/day]")
 
 # # Legends merged
