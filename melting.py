@@ -11,10 +11,67 @@ import pandas as pd
 import xarray as xr
 import matplotlib.pyplot as plt
 
-def get_status_and_delta(SCA, ta, era5, temp_thres=1.0, prec_thres=1.0):
+def build_weather_status(
+    temperature,
+    precipitation,
+    sca_percent,
+    temperature_threshold=275.15,
+    precipitation_threshold=2.0,
+    sca_increase_threshold=10.0,
+):
+    """Classify accumulation, melting, and neutral weather conditions.
+
+    Status is 1 on wet, cold days and on wet, warm days accompanied by a
+    basin-wide SCA increase. Warm days that do not meet those accumulation
+    conditions are -1 (melting), while the remaining days are 0 (neutral).
+    SCA and ``sca_increase_threshold`` are expressed in percentage points.
+    """
+    if isinstance(sca_percent, pd.Series):
+        sca_percent = xr.DataArray(
+            sca_percent.to_numpy(),
+            coords={"time": pd.DatetimeIndex(sca_percent.index)},
+            dims="time",
+            name="SCA",
+        )
+    if sca_percent.dims != ("time",):
+        raise ValueError("sca_percent must be a one-dimensional daily time series")
+
+    sca_increase = sca_percent.diff("time", label="upper")
+    sca_increase = sca_increase.reindex(time=temperature.time, fill_value=0)
+
+    wet = precipitation > precipitation_threshold
+    cold = temperature < temperature_threshold
+    warm = temperature > temperature_threshold
+    substantial_sca_increase = sca_increase > sca_increase_threshold
+
+    accumulation = wet & (cold | (warm & substantial_sca_increase))
+    return xr.where(accumulation, 1, xr.where(warm, -1, 0)).astype("int8")
+
+
+def _basin_sca_percent(SCA):
+    """Return daily basin-wide SCA in percentage points from an SCA cube."""
+    sca = SCA["SCA"] if isinstance(SCA, xr.Dataset) else SCA
+    spatial_dims = [dim for dim in ("x", "y") if dim in sca.dims]
+    if len(spatial_dims) != 2:
+        raise ValueError("SCA must have time, x, and y dimensions")
+    return sca.where(sca <= 100).mean(dim=spatial_dims)
+
+
+def get_status_and_delta(
+    SCA,
+    ta,
+    era5,
+    temp_thres=None,
+    prec_thres=None,
+    sca_percent=None,
+    *,
+    temperature_threshold=275.15,
+    precipitation_threshold=5.0,
+    sca_increase_threshold=10.0,
+):
     """
     Compute:
-      (1) Boolean accumulation mask: True = accumulation, False = melting/other
+      (1) Weather status: 1 = accumulation, -1 = melting, 0 = neutral
       (2) Fraction of precipitation contributing to SWE accumulation (per timestep)
 
     Parameters
@@ -22,19 +79,26 @@ def get_status_and_delta(SCA, ta, era5, temp_thres=1.0, prec_thres=1.0):
     SCA : xarray.DataArray
         Snow cover area classification (dims: time,x,y)
     ta : xarray.DataArray or Dataset
-        Air temperature time series (°C) with variable 't2m'
+        Air temperature time series with variable 't2m'. The main workflow
+        supplies it in kelvin, matching ``temperature_threshold``.
     era5 : xarray.Dataset or DataArray
         ERA5-Land dataset containing variable 'tp' (precipitation, meters)
-    temp_thres : float
-        Temperature threshold for accumulation (default = 1°C)
-    prec_thres : float
-        Precipitation threshold for accumulation (default = 1 mm/day)
+    temperature_threshold : float
+        Temperature threshold in the same units as ``ta['t2m']``.
+    precipitation_threshold : float
+        Precipitation threshold in the same units as ``era5['tp']``.
+    sca_increase_threshold : float
+        Basin-wide daily SCA increase threshold, in percentage points.
+    sca_percent : xarray.DataArray or pandas.Series, optional
+        Basin-wide daily SCA. It is derived from ``SCA`` when omitted.
+    temp_thres, prec_thres : float, optional
+        Backward-compatible aliases for the temperature and precipitation
+        thresholds.
 
     Returns
     -------
-    status : xarray.DataArray (bool)
-        True where accumulation conditions are met
-        False where melting or no-precipitation
+    status : xarray.DataArray (int8)
+        1 for accumulation, -1 for melting, and 0 for neutral conditions.
     delta : xarray.DataArray (float32)
         Fraction of total accumulation at each timestep
         Sum over time per pixel ≈ 1 (where accumulation occurs)
@@ -48,22 +112,23 @@ def get_status_and_delta(SCA, ta, era5, temp_thres=1.0, prec_thres=1.0):
     # Reproject onto SCA grid
     pr_reprojected = pr.rio.reproject_match(SCA)
 
-    # Boolean accumulation mask
-    status = xr.where(
-                    (ta['t2m'] < 2) & (pr_reprojected > prec_thres),
-                    1,
-                    -1
-                ).astype('int8')
-    
-    # status = xr.where(
-    #         (ta['t2m'] < 2) & (pr_reprojected > prec_thres),
-    #         1,
-    #         xr.where(
-    #             ta['t2m'] > temp_thres,
-    #             -1,
-    #             0
-    #         )
-    #     ).astype('int8')
+    # Preserve the old keyword names while using the harmonization workflow's
+    # threshold names for new callers.
+    if temp_thres is not None:
+        temperature_threshold = temp_thres
+    if prec_thres is not None:
+        precipitation_threshold = prec_thres
+    if sca_percent is None:
+        sca_percent = _basin_sca_percent(SCA)
+
+    status = build_weather_status(
+        temperature=ta["t2m"],
+        precipitation=pr_reprojected,
+        sca_percent=sca_percent,
+        temperature_threshold=temperature_threshold,
+        precipitation_threshold=precipitation_threshold,
+        sca_increase_threshold=sca_increase_threshold,
+    )
     
 
     # Masked precipitation
@@ -176,10 +241,15 @@ def compute_state_and_accumulation(SCA, melt, status, delta):
         changes[i+1,:,:][mask_snow_end] = -2
 
         # --- Compute total accumulation (or total melt) ---
-        melt_curr[changes[i+1,:,:] > 0] = 0  # skip accumulation pixels
+        # Melt energy contributes only under melting conditions. In
+        # particular, neutral status (0) must not be treated as melting.
+        melt_curr[status[dict(time=i)].values != -1] = 0
 
         tot_acc[i+1,:,:] = tot_acc[i,:,:] + melt_curr
-        tot_acc[i+1,:,:][changes[i+1,:,:] == 0] = 0 # reset where snow-free
+        # Reset only genuinely snow-free days. The melt-out day itself must
+        # retain the completed period's total for the final calibration mask.
+        reset = (~mask_snow) & (~mask_snow_end)
+        tot_acc[i+1,:,:][reset] = 0
         tot_acc[i+1,:,:][mask_snow_start] = melt_curr[mask_snow_start]
 
 
@@ -188,7 +258,7 @@ def compute_state_and_accumulation(SCA, melt, status, delta):
         delta_sca[status[dict(time=i+1)].values != 1] = 0
 
         sca_sum[i+1,:,:] = sca_sum[i,:,:] + delta_sca
-        sca_sum[i+1,:,:][changes[i+1,:,:] == 0] = 0 # reset where snow-free
+        sca_sum[i+1,:,:][reset] = 0
         sca_sum[i+1,:,:][mask_snow_start] = delta_sca[mask_snow_start]
 
     # --- Final masking: keep only the values when melt-out ---
@@ -217,7 +287,7 @@ def compute_state_and_accumulation(SCA, melt, status, delta):
 def get_swe(SCA, melt, status, delta, sca_sum_xr, tot_acc_xr):
     """
     Compute Snow Water Equivalent (SWE) time series using:
-    - status_xr: accumulation/melting mask (+1/-1)
+    - status_xr: accumulation/melting/neutral mask (+1/-1/0)
     - delta: fractional precipitation contributions
     - sca_sum_xr: fractional snow accumulation
     - tot_acc_xr: total accumulation energy
@@ -231,7 +301,7 @@ def get_swe(SCA, melt, status, delta, sca_sum_xr, tot_acc_xr):
     ta : xr.Dataset or DataArray
         Air temperature dataset containing 't2m' in °C
     status : xr.DataArray
-        Accumulation status mask (+1 accumulation, -1 melting)
+        Status mask (+1 accumulation, -1 melting, 0 neutral)
     delta : xr.DataArray
         Fractional precipitation available for SWE accumulation
     sca_sum_xr : np.ndarray
@@ -255,6 +325,10 @@ def get_swe(SCA, melt, status, delta, sca_sum_xr, tot_acc_xr):
 
         melt_curr = melt.isel(time=i).values.copy()
         snow_curr = SCA.isel(time=i+1)['SCA'].values
+
+        # Carry SWE through neutral conditions, then update accumulation and
+        # melting pixels explicitly.
+        swe[i+1] = swe[i]
 
         # Masks
         mask_acc = status.isel(time=i+1).values == 1
@@ -556,4 +630,3 @@ def get_melt_pomeroy(SCA, ta, pr_reprojected, SW, status, TF=1.2, SRF=0.2256, T_
 # # Finish layout
 # fig.tight_layout()
 # plt.show()
-

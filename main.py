@@ -78,7 +78,7 @@ def run_swe_reconstruction(config):
     sca_path = glob.glob(dirname + os.sep + catchment + '*' + hy_xxxx + '*.nc')[0]
     
         
-    outname = outdir + os.sep + os.path.basename(sca_path).replace('harm_bias','swe_bias')
+    outname = outdir + os.sep + os.path.basename(sca_path).replace('harm','swe')
     
     if os.path.exists(outname):
         print('File %s has been already created' %outname)
@@ -86,8 +86,8 @@ def run_swe_reconstruction(config):
     else:
         
         # ---- loading the snow cover area and related information
-        sca_old_path = os.path.dirname(sca_path).replace('sca_harm_bias','daily_sca') 
-        csv_path = os.path.join(sca_old_path, f"{catchment}_{hy_xxxx}.csv")
+        sca_old_path = os.path.dirname(sca_path).replace('DAILY_HARM','DAILY') 
+        csv_path = os.path.join(sca_old_path, f"{catchment}_{hy_xxxx}_SCF_interp.csv")
         df = pd.read_csv(csv_path, index_col='Unnamed: 0')
         
         SCA, epsg_code = upload_sca(sca_path, dem_path, None)
@@ -101,7 +101,8 @@ def run_swe_reconstruction(config):
 
         
         # --- meteorological data ---
-        ta = load_micromet(temp_dir, hy_xxxx) - 273.15
+        ta_kelvin = load_micromet(temp_dir, hy_xxxx)
+        ta = ta_kelvin - 273.15
         # ta = ta.chunk({'time':1, 'x':512, 'y':512})
         # ta = ta.load()
         SW = load_micromet(SW_dir, hy_xxxx)
@@ -111,16 +112,30 @@ def run_swe_reconstruction(config):
         era5 = load_era5land(era5_dir, hy_xxxx)
         
         
-        temp_thres=0
-        prec_thres=10
+        temperature_threshold = config.get('temperature_threshold', 275.15)
+        precipitation_threshold = config.get('precipitation_threshold', 5)
+        sca_increase_threshold = config.get('sca_increase_threshold', 10)
+
+        # Use the same basin-wide SCA series as the harmonization workflow
+        # when it is available; otherwise derive it from the SCA cube.
+        sca_percent = None
+        if 'SCA final' in df.columns:
+            df.index = pd.to_datetime(df.index)
+            sca_percent = df['SCA final']
         # era5 = era5.load()
         
         # extract the status and delta
-        # status : boolean accumulation mask: True = accumulation, False = melting/other
+        # status: 1 = accumulation, -1 = melting, 0 = neutral
         # delta: fraction of precipitation contributing to SWE accumulation (per timestep)
-        status, delta, pr_reprojected = get_status_and_delta(SCA, ta, era5, 
-                                                             temp_thres=temp_thres, 
-                                                             prec_thres=prec_thres)
+        status, delta, pr_reprojected = get_status_and_delta(
+            SCA,
+            ta_kelvin,
+            era5,
+            sca_percent=sca_percent,
+            temperature_threshold=temperature_threshold,
+            precipitation_threshold=precipitation_threshold,
+            sca_increase_threshold=sca_increase_threshold,
+        )
        
        
         # compute the potential melt 
@@ -131,7 +146,10 @@ def run_swe_reconstruction(config):
         TF = 0.24 # melt factor mm / (°C day)
         SRF = 0.15 # melt factor mm / (°C day)
         # melt = get_melt(SCA, ta, pr_reprojected, SW, status, TF = TF, SRF = SRF)
-        melt = get_melt_pomeroy(SCA, ta, pr_reprojected, SW, status, TF = TF, SRF = SRF, T_thresh=temp_thres)
+        melt = get_melt_pomeroy(
+            SCA, ta, pr_reprojected, SW, status, TF=TF, SRF=SRF,
+            T_thresh=temperature_threshold - 273.15,
+        )
 
         
         sca_sum_xr, tot_acc_xr = compute_state_and_accumulation(SCA, melt, status, delta)
@@ -174,4 +192,4 @@ if __name__ == "__main__":
         
         config["hy_xxxx"] = f"hy{year}"
         
-        run_swe_reconstruction(config)
+        # run_swe_reconstruction(config)
